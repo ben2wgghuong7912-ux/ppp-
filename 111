@@ -1,0 +1,421 @@
+import { useState, useRef, useCallback, useEffect } from "react";
+
+const FILTERS = [
+  { id: "none", label: "原图" },
+  { id: "chibi", label: "Q版简化" },
+  { id: "vivid", label: "鲜明色彩" },
+  { id: "bw", label: "黑白配色" },
+  { id: "warm", label: "暖色调" },
+  { id: "cool", label: "冷色调" },
+  { id: "pastel", label: "马卡龙" },
+  { id: "neon", label: "霓虹" },
+];
+
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+function hexToRgb(hex) {
+  const v = parseInt(hex.slice(1), 16);
+  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+}
+function colorDist(a, b) {
+  return (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2;
+}
+function boostSat(r, g, b, f) {
+  const gray = 0.299*r + 0.587*g + 0.114*b;
+  return [
+    Math.max(0, Math.min(255, Math.round(gray + (r-gray)*f))),
+    Math.max(0, Math.min(255, Math.round(gray + (g-gray)*f))),
+    Math.max(0, Math.min(255, Math.round(gray + (b-gray)*f))),
+  ];
+}
+function applyFilter(r, g, b, filter) {
+  switch (filter) {
+    case "chibi": {
+      const f = 64;
+      return boostSat(Math.round(r/f)*f, Math.round(g/f)*f, Math.round(b/f)*f, 1.6);
+    }
+    case "vivid": return boostSat(r, g, b, 2.0);
+    case "bw": { const gr = Math.round(0.299*r+0.587*g+0.114*b) > 128 ? 240 : 20; return [gr,gr,gr]; }
+    case "warm": return boostSat(Math.min(255,r*1.15), Math.min(255,g*1.05), Math.max(0,b*0.85), 1.2);
+    case "cool": return boostSat(Math.max(0,r*0.85), Math.min(255,g*1.02), Math.min(255,b*1.2), 1.2);
+    case "pastel": return [Math.round(r*0.6+255*0.4), Math.round(g*0.6+255*0.4), Math.round(b*0.6+255*0.4)];
+    case "neon": { const [nr,ng,nb] = boostSat(r,g,b,2.5); return [Math.min(255,nr*1.1|0),Math.min(255,ng*1.1|0),Math.min(255,nb*1.1|0)]; }
+    default: return [r, g, b];
+  }
+}
+function medianCut(pixels, maxColors) {
+  if (!pixels.length) return [[128,128,128]];
+  function avg(bucket) {
+    if (!bucket.length) return [128,128,128];
+    let sr=0,sg=0,sb=0;
+    for (const p of bucket) { sr+=p[0]; sg+=p[1]; sb+=p[2]; }
+    return [sr/bucket.length|0, sg/bucket.length|0, sb/bucket.length|0];
+  }
+  function cut(bucket) {
+    let minR=255,maxR=0,minG=255,maxG=0,minB=255,maxB=0;
+    for (const p of bucket) {
+      if(p[0]<minR)minR=p[0]; if(p[0]>maxR)maxR=p[0];
+      if(p[1]<minG)minG=p[1]; if(p[1]>maxG)maxG=p[1];
+      if(p[2]<minB)minB=p[2]; if(p[2]>maxB)maxB=p[2];
+    }
+    const ch = (maxR-minR)>=(maxG-minG)&&(maxR-minR)>=(maxB-minB)?0:(maxG-minG)>=(maxB-minB)?1:2;
+    bucket.sort((a,b)=>a[ch]-b[ch]);
+    const mid = bucket.length>>1;
+    return [bucket.slice(0,mid), bucket.slice(mid)];
+  }
+  let buckets = [pixels];
+  while (buckets.length < maxColors) {
+    let li = 0;
+    for (let i=1;i<buckets.length;i++) if (buckets[i].length>buckets[li].length) li=i;
+    if (buckets[li].length<=1) break;
+    const [a,b] = cut(buckets[li]);
+    buckets.splice(li,1,a,b);
+  }
+  return buckets.filter(b=>b.length>0).map(avg);
+}
+
+export default function BeadPixel() {
+  const [imgSrc, setImgSrc] = useState(null);
+  const [imgName, setImgName] = useState(null);
+  const [blockSize, setBlockSize] = useState(8);
+  const [maxColors, setMaxColors] = useState(36);
+  const [filter, setFilter] = useState("none");
+  const [result, setResult] = useState(null); // { pixels, palette, gridW, gridH }
+  const [generating, setGenerating] = useState(false);
+  const [view, setView] = useState("pixel"); // pixel | palette
+  const [hoverCell, setHoverCell] = useState(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailHover, setDetailHover] = useState(null);
+  const [progress, setProgress] = useState(0);
+
+  const canvasRef = useRef(null);
+  const detailCanvasRef = useRef(null);
+  const fileRef = useRef(null);
+  const imgRef = useRef(null);
+
+  // Draw pixel canvas whenever result changes
+  useEffect(() => {
+    if (!result || !canvasRef.current) return;
+    const { pixels, gridW, gridH } = result;
+    const cell = 18, gap = 1;
+    const canvas = canvasRef.current;
+    canvas.width = gridW*(cell+gap)-gap;
+    canvas.height = gridH*(cell+gap)-gap;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    for (let i=0;i<pixels.length;i++) {
+      const gx=i%gridW, gy=i/gridW|0;
+      const [r,g,b]=pixels[i];
+      ctx.fillStyle=`rgb(${r},${g},${b})`;
+      ctx.fillRect(gx*(cell+gap), gy*(cell+gap), cell, cell);
+    }
+  }, [result]);
+
+  // Draw detail canvas
+  useEffect(() => {
+    if (!detailOpen || !result || !detailCanvasRef.current) return;
+    const { pixels, gridW, gridH } = result;
+    const cell = 36, gap = 1;
+    const canvas = detailCanvasRef.current;
+    canvas.width = gridW*(cell+gap)-gap;
+    canvas.height = gridH*(cell+gap)-gap;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    for (let i=0;i<pixels.length;i++) {
+      const gx=i%gridW, gy=i/gridW|0;
+      const [r,g,b]=pixels[i];
+      ctx.fillStyle=`rgb(${r},${g},${b})`;
+      ctx.fillRect(gx*(cell+gap), gy*(cell+gap), cell, cell);
+    }
+  }, [detailOpen, result]);
+
+  const handleFile = (file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      setImgSrc(ev.target.result);
+      setImgName(file.name);
+      setResult(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const generate = useCallback(() => {
+    if (!imgSrc) return;
+    setGenerating(true);
+    setProgress(10);
+    setTimeout(() => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 400;
+        let sw = img.width, sh = img.height;
+        if (sw > maxDim || sh > maxDim) {
+          const s = Math.min(maxDim/sw, maxDim/sh);
+          sw = Math.round(sw*s); sh = Math.round(sh*s);
+        }
+        const src = document.createElement("canvas");
+        src.width=sw; src.height=sh;
+        const sctx = src.getContext("2d");
+        sctx.drawImage(img,0,0,sw,sh);
+        setProgress(25);
+
+        const raw = sctx.getImageData(0,0,sw,sh).data;
+        const filt = new Uint8ClampedArray(raw.length);
+        for (let i=0;i<raw.length;i+=4) {
+          const [fr,fg,fb] = applyFilter(raw[i],raw[i+1],raw[i+2], filter);
+          filt[i]=fr; filt[i+1]=fg; filt[i+2]=fb; filt[i+3]=raw[i+3];
+        }
+        setProgress(45);
+
+        const bs = blockSize;
+        const gridW = Math.ceil(sw/bs), gridH = Math.ceil(sh/bs);
+        const blockAvgs = [];
+        for (let gy=0;gy<gridH;gy++) {
+          for (let gx=0;gx<gridW;gx++) {
+            let sr=0,sg=0,sb=0,cnt=0;
+            for (let py=gy*bs;py<Math.min((gy+1)*bs,sh);py++) {
+              for (let px=gx*bs;px<Math.min((gx+1)*bs,sw);px++) {
+                const idx=(py*sw+px)*4;
+                sr+=filt[idx]; sg+=filt[idx+1]; sb+=filt[idx+2]; cnt++;
+              }
+            }
+            blockAvgs.push([sr/cnt|0, sg/cnt|0, sb/cnt|0]);
+          }
+        }
+        setProgress(65);
+
+        const palette = medianCut([...blockAvgs], maxColors);
+        const mapped = blockAvgs.map(bc => {
+          let best=palette[0], bd=Infinity;
+          for (const pc of palette) { const d=colorDist(bc,pc); if(d<bd){bd=d;best=pc;} }
+          return best;
+        });
+        setProgress(85);
+
+        const counts = {};
+        for (const c of mapped) { const h=rgbToHex(...c); counts[h]=(counts[h]||0)+1; }
+        const sortedPalette = Object.entries(counts)
+          .sort((a,b)=>b[1]-a[1])
+          .map(([hex,count])=>({hex,count,rgb:hexToRgb(hex)}));
+
+        setResult({ pixels: mapped, palette: sortedPalette, gridW, gridH });
+        setProgress(100);
+        setTimeout(()=>{ setGenerating(false); setProgress(0); }, 300);
+      };
+      img.src = imgSrc;
+    }, 30);
+  }, [imgSrc, blockSize, maxColors, filter]);
+
+  const handleDetailMouseMove = (e) => {
+    if (!result || !detailCanvasRef.current) return;
+    const canvas = detailCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const cell=36, gap=1;
+    const scaleX = canvas.width/rect.width;
+    const scaleY = canvas.height/rect.height;
+    const cx = Math.floor((e.clientX-rect.left)*scaleX/(cell+gap));
+    const cy = Math.floor((e.clientY-rect.top)*scaleY/(cell+gap));
+    const idx = cy*result.gridW+cx;
+    if (idx>=0 && idx<result.pixels.length) {
+      const [r,g,b] = result.pixels[idx];
+      setDetailHover({ x:cx, y:cy, hex:rgbToHex(r,g,b), r, g, b });
+    }
+  };
+
+  const exportPNG = () => {
+    if (!canvasRef.current) return;
+    const a = document.createElement("a");
+    a.download = `bead-pixel-${Date.now()}.png`;
+    a.href = canvasRef.current.toDataURL("image/png");
+    a.click();
+  };
+
+  const S = {
+    root: { fontFamily:"'Noto Sans SC',sans-serif", background:"#0f0e0d", color:"#e8e4dc", minHeight:"100vh", display:"flex", flexDirection:"column" },
+    header: { padding:"18px 28px 14px", borderBottom:"1px solid #2e2c2a", display:"flex", alignItems:"baseline", gap:14, background:"#1a1917" },
+    h1: { fontFamily:"monospace", fontSize:"0.95rem", letterSpacing:"0.14em", color:"#e8c547", textTransform:"uppercase", fontWeight:700 },
+    sub: { fontFamily:"monospace", fontSize:"0.68rem", color:"#7a7570" },
+    body: { display:"grid", gridTemplateColumns:"300px 1fr", flex:1, minHeight:0 },
+    panel: { borderRight:"1px solid #2e2c2a", padding:"20px 18px", display:"flex", flexDirection:"column", gap:18, overflowY:"auto", background:"#1a1917" },
+    sectionLabel: { fontFamily:"monospace", fontSize:"0.58rem", letterSpacing:"0.18em", color:"#7a7570", textTransform:"uppercase", marginBottom:8, display:"block" },
+    uploadZone: { border:"1px dashed #2e2c2a", borderRadius:4, padding:"22px 12px", textAlign:"center", cursor:"pointer", transition:"all 0.2s" },
+    uploadText: { fontSize:"0.78rem", color:"#7a7570", lineHeight:1.7 },
+    sliderRow: { display:"flex", flexDirection:"column", gap:6 },
+    sliderLabel: { display:"flex", justifyContent:"space-between", fontSize:"0.78rem", color:"#b0aa9f" },
+    sliderVal: { fontFamily:"monospace", fontSize:"0.72rem", color:"#e8c547", background:"rgba(232,197,71,0.1)", padding:"1px 6px", borderRadius:2 },
+    filterGrid: { display:"grid", gridTemplateColumns:"1fr 1fr", gap:6 },
+    filterBtn: (active) => ({ padding:"8px 6px", border:`1px solid ${active?"#e8c547":"#2e2c2a"}`, background:active?"rgba(232,197,71,0.1)":"#232220", color:active?"#e8c547":"#b0aa9f", fontSize:"0.76rem", borderRadius:3, cursor:"pointer", transition:"all 0.15s", fontFamily:"'Noto Sans SC',sans-serif" }),
+    btnPrimary: (disabled) => ({ width:"100%", padding:"11px", background:disabled?"#2e2c2a":"#e8c547", color:disabled?"#555":"#0f0e0d", border:"none", borderRadius:3, fontFamily:"monospace", fontSize:"0.78rem", letterSpacing:"0.1em", textTransform:"uppercase", cursor:disabled?"not-allowed":"pointer", fontWeight:700 }),
+    btnSecondary: { width:"100%", padding:"9px", background:"transparent", color:"#b0aa9f", border:"1px solid #2e2c2a", borderRadius:3, fontFamily:"monospace", fontSize:"0.7rem", letterSpacing:"0.08em", textTransform:"uppercase", cursor:"pointer" },
+    divider: { border:"none", borderTop:"1px solid #2e2c2a", margin:0 },
+    right: { display:"flex", flexDirection:"column", background:"#0f0e0d" },
+    toolbar: { display:"flex", alignItems:"center", gap:10, padding:"10px 20px", borderBottom:"1px solid #2e2c2a", background:"#1a1917", flexShrink:0 },
+    tab: (active) => ({ fontFamily:"monospace", fontSize:"0.66rem", letterSpacing:"0.1em", textTransform:"uppercase", color:active?"#e8c547":"#7a7570", cursor:"pointer", padding:"4px 8px", borderRadius:2, background:active?"rgba(232,197,71,0.1)":"transparent" }),
+    info: { fontFamily:"monospace", fontSize:"0.62rem", color:"#7a7570", marginLeft:"auto" },
+    viewport: { flex:1, overflow:"auto", padding:24, display:"flex", flexDirection:"column", gap:24, alignItems:"flex-start" },
+    empty: { display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", width:"100%", minHeight:360, gap:10, color:"#7a7570" },
+    emptyIcon: { fontSize:"2.5rem" },
+    paletteHeader: { fontFamily:"monospace", fontSize:"0.58rem", letterSpacing:"0.18em", color:"#7a7570", textTransform:"uppercase", marginBottom:12 },
+    paletteGrid: { display:"flex", flexWrap:"wrap", gap:8 },
+    swatch: { display:"flex", flexDirection:"column", alignItems:"center", gap:3 },
+    swatchColor: (hex) => ({ width:34, height:34, borderRadius:3, background:hex, border:"1px solid rgba(255,255,255,0.07)" }),
+    swatchCode: { fontFamily:"monospace", fontSize:"0.56rem", color:"#7a7570", textAlign:"center", width:34 },
+    swatchCount: { fontFamily:"monospace", fontSize:"0.52rem", color:"#7a7570", opacity:0.6 },
+    progressWrap: { width:"100%", height:2, background:"#2e2c2a", borderRadius:1, overflow:"hidden" },
+    progressInner: (pct) => ({ height:"100%", width:`${pct}%`, background:"#e8c547", transition:"width 0.1s", borderRadius:1 }),
+    // detail modal
+    modal: { position:"fixed", inset:0, background:"rgba(0,0,0,0.9)", zIndex:1000, overflow:"auto", padding:24, display:"flex", flexDirection:"column", gap:16, alignItems:"flex-start" },
+    modalHeader: { display:"flex", alignItems:"center", gap:14 },
+    closeBtn: { background:"none", border:"1px solid #2e2c2a", color:"#b0aa9f", cursor:"pointer", fontFamily:"monospace", fontSize:"0.68rem", padding:"5px 12px", borderRadius:2, textTransform:"uppercase", letterSpacing:"0.1em" },
+    detailInfoText: { fontFamily:"monospace", fontSize:"0.68rem", color:"#7a7570" },
+  };
+
+  return (
+    <div style={S.root}>
+      <header style={S.header}>
+        <span style={S.h1}>BEAD PIXEL</span>
+        <span style={S.sub}>拼豆像素图生成器</span>
+      </header>
+
+      <div style={S.body}>
+        {/* LEFT PANEL */}
+        <div style={S.panel}>
+          <div>
+            <span style={S.sectionLabel}>上传图片</span>
+            <label style={{...S.uploadZone, borderColor: imgSrc ? "#e8c547" : "#2e2c2a"}}>
+              <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}}
+                onChange={e => handleFile(e.target.files[0])} />
+              <div style={{fontSize:"1.8rem", marginBottom:6}}>⬡</div>
+              <div style={S.uploadText}>
+                {imgName
+                  ? <><strong style={{color:"#e8e4dc"}}>{imgName}</strong></>
+                  : <><strong style={{color:"#b0aa9f"}}>点击上传</strong> 或拖拽图片<br/>JPG · PNG · GIF · WEBP</>}
+              </div>
+            </label>
+          </div>
+
+          <hr style={S.divider} />
+
+          <div style={S.sliderRow}>
+            <span style={S.sectionLabel}>像素块大小</span>
+            <label style={S.sliderLabel}>
+              每块像素数 <span style={S.sliderVal}>{blockSize}</span>
+            </label>
+            <input type="range" min={4} max={32} step={2} value={blockSize}
+              onChange={e => setBlockSize(+e.target.value)}
+              style={{width:"100%", accentColor:"#e8c547"}} />
+          </div>
+
+          <div style={S.sliderRow}>
+            <span style={S.sectionLabel}>色号数量上限</span>
+            <label style={S.sliderLabel}>
+              最多颜色数 <span style={S.sliderVal}>{maxColors}</span>
+            </label>
+            <input type="range" min={4} max={128} step={2} value={maxColors}
+              onChange={e => setMaxColors(+e.target.value)}
+              style={{width:"100%", accentColor:"#e8c547"}} />
+          </div>
+
+          <hr style={S.divider} />
+
+          <div>
+            <span style={S.sectionLabel}>滤镜效果</span>
+            <div style={S.filterGrid}>
+              {FILTERS.map(f => (
+                <button key={f.id} style={S.filterBtn(filter===f.id)}
+                  onClick={() => setFilter(f.id)}>{f.label}</button>
+              ))}
+            </div>
+          </div>
+
+          <hr style={S.divider} />
+
+          {generating && (
+            <div style={S.progressWrap}>
+              <div style={S.progressInner(progress)} />
+            </div>
+          )}
+
+          <button style={S.btnPrimary(!imgSrc || generating)}
+            disabled={!imgSrc || generating}
+            onClick={generate}>
+            {generating ? "生成中..." : "生成像素图"}
+          </button>
+          <button style={{...S.btnSecondary, opacity: result?1:0.35, cursor:result?"pointer":"not-allowed"}}
+            disabled={!result} onClick={() => setDetailOpen(true)}>
+            查看超大细节图
+          </button>
+          <button style={{...S.btnSecondary, opacity: result?1:0.35, cursor:result?"pointer":"not-allowed"}}
+            disabled={!result} onClick={exportPNG}>
+            导出图片
+          </button>
+        </div>
+
+        {/* RIGHT */}
+        <div style={S.right}>
+          <div style={S.toolbar}>
+            {["pixel","palette"].map(v => (
+              <div key={v} style={S.tab(view===v)} onClick={() => setView(v)}>
+                {v==="pixel" ? "像素图" : "色号表"}
+              </div>
+            ))}
+            <div style={S.info}>
+              {result ? `${result.gridW} × ${result.gridH} 格 · ${result.palette.length} 色` : "— 尚未生成 —"}
+            </div>
+          </div>
+
+          <div style={S.viewport}>
+            {!result && (
+              <div style={S.empty}>
+                <div style={S.emptyIcon}>⬡</div>
+                <div style={{fontSize:"0.82rem"}}>上传图片后点击生成</div>
+              </div>
+            )}
+
+            {result && view === "pixel" && (
+              <canvas ref={canvasRef} style={{display:"block", imageRendering:"pixelated"}} />
+            )}
+
+            {result && view === "palette" && (
+              <div style={{width:"100%"}}>
+                <div style={S.paletteHeader}>共 {result.palette.length} 色</div>
+                <div style={S.paletteGrid}>
+                  {result.palette.map(({hex, count}) => (
+                    <div key={hex} style={S.swatch} title={hex}>
+                      <div style={S.swatchColor(hex)} />
+                      <div style={S.swatchCode}>{hex}</div>
+                      <div style={S.swatchCount}>×{count}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* DETAIL MODAL */}
+      {detailOpen && (
+        <div style={S.modal}>
+          <div style={S.modalHeader}>
+            <button style={S.closeBtn} onClick={() => { setDetailOpen(false); setDetailHover(null); }}>
+              ✕ 关闭
+            </button>
+            <div style={S.detailInfoText}>
+              {detailHover
+                ? `[${detailHover.x}, ${detailHover.y}] · ${detailHover.hex} · rgb(${detailHover.r},${detailHover.g},${detailHover.b})`
+                : "悬停格子查看色号"}
+            </div>
+          </div>
+          <canvas ref={detailCanvasRef}
+            style={{display:"block", maxWidth:"100%", cursor:"crosshair", imageRendering:"pixelated"}}
+            onMouseMove={handleDetailMouseMove}
+            onMouseLeave={() => setDetailHover(null)} />
+        </div>
+      )}
+    </div>
+  );
+}
